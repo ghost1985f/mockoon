@@ -32,11 +32,9 @@ export class EnvironmentsService {
   public routesTotal = 0;
   private dialog = remote.dialog;
   private BrowserWindow = remote.BrowserWindow;
-
   private environmentSchema: EnvironmentType = {
     uuid: '',
     running: false,
-    instance: null,
     name: '',
     endpointPrefix: '',
     latency: 0,
@@ -54,7 +52,6 @@ export class EnvironmentsService {
   };
 
   private environmentResetSchema: Partial<EnvironmentType> = {
-    instance: null,
     running: false,
     startedAt: null,
     modifiedAt: null,
@@ -295,7 +292,7 @@ export class EnvironmentsService {
   }
 
   /**
-   * Clean environments before saving (avoid saving server instance and things like this)
+   * Clean environments before saving
    *
    */
   private cleanBeforeSave() {
@@ -303,7 +300,6 @@ export class EnvironmentsService {
       const environmentCopy = cloneDeep(environment);
 
       // remove some items
-      delete environmentCopy.instance;
       delete environmentCopy.running;
       delete environmentCopy.startedAt;
       delete environmentCopy.needRestart;
@@ -434,7 +430,7 @@ export class EnvironmentsService {
    */
   public exportAllEnvironments() {
     this.dialog.showSaveDialog(this.BrowserWindow.getFocusedWindow(), { filters: [{ name: 'JSON', extensions: ['json'] }] }, (path) => {
-      // reset environments before exporting (cannot export running env with server instance)
+      // reset environments before exporting
       const dataToExport = cloneDeep(this.environments);
       dataToExport.forEach(environment => {
         Object.assign(environment, this.environmentResetSchema);
@@ -463,7 +459,7 @@ export class EnvironmentsService {
    */
   public exportEnvironmentToClipboard(environmentIndex: number) {
     try {
-      // reset environment before exporting (cannot export running env with server instance)
+      // reset environment before exporting
       clipboard.writeText(this.dataService.wrapExport({ ...cloneDeep(this.environments[environmentIndex]), ...this.environmentResetSchema }, 'environment'));
       this.alertService.showAlert('success', Messages.EXPORT_ENVIRONMENT_CLIPBOARD_SUCCESS);
       this.eventsService.analyticsEvents.next(AnalyticsEvents.EXPORT_CLIPBOARD);

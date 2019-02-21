@@ -28,6 +28,8 @@ const httpsConfig = {
 @Injectable()
 export class ServerService {
   public environmentsLogs: EnvironmentLogsType = {};
+  // store running servers instances
+  private instances: { [key: string]: any };
 
   constructor(
     private alertService: AlertService,
@@ -63,8 +65,8 @@ export class ServerService {
     }
 
     // listen to port
-    serverInstance.listen(environment.port, (error, success) => {
-      environment.instance = serverInstance;
+    serverInstance.listen(environment.port, () => {
+      this.instances[environment.uuid] = serverInstance;
       environment.running = true;
       environment.startedAt = new Date();
     });
@@ -99,9 +101,11 @@ export class ServerService {
    * @param environment - an environment
    */
   public stop(environment: EnvironmentType) {
-    if (environment.instance) {
-      environment.instance.kill(() => {
-        environment.instance = null;
+    const instance = this.instances[environment.uuid];
+
+    if (instance) {
+      instance.kill(() => {
+        delete this.instances[environment.uuid];
         environment.running = false;
         environment.startedAt = null;
       });

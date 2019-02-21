@@ -3,7 +3,6 @@ import { HeaderType, RouteType } from 'src/app/types/route.type';
 export type EnvironmentType = {
   uuid: string;
   running: boolean;
-  instance: any;
   name: string;
   port: number;
   endpointPrefix: string;
