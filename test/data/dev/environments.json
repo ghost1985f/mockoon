@@ -13,7 +13,8 @@
         "body": "42",
         "latency": 0,
         "statusCode": "200",
-        "file": null,
+        "filePath": "",
+        "sendFileAsBody": false,
         "duplicates": [],
         "documentation": "",
         "headers": [
@@ -31,7 +32,8 @@
         "body": "{\n    \"response\": \"So Long, and Thanks for All the Fish\"\n}",
         "latency": 0,
         "statusCode": "200",
-        "file": null,
+        "filePath": "",
+        "sendFileAsBody": false,
         "duplicates": [],
         "documentation": "",
         "headers": [
@@ -57,7 +59,8 @@
             "value": ""
           }
         ],
-        "file": null,
+        "filePath": "",
+        "sendFileAsBody": false,
         "duplicates": []
       },
       {
@@ -75,11 +78,11 @@
             "value": ""
           }
         ],
-        "file": null,
+        "filePath": "",
+        "sendFileAsBody": false,
         "duplicates": []
       }
     ],
-    "modifiedAt": "2019-02-17T20:49:34.811Z",
     "duplicates": [
       1
     ],
@@ -91,7 +94,7 @@
       {
         "uuid": "6e07e360-0146-11e9-9538-0b13aac74cb1",
         "key": "Access-Control-Allow-Origin",
-        "value": "pout"
+        "value": "test"
       }
     ]
   },
@@ -103,7 +106,7 @@
     "port": 3001,
     "routes": [
       {
-        "uuid": "",
+        "uuid": "6e07e360-0126-11e9-9518-0b13aac74cb1",
         "documentation": "",
         "method": "get",
         "endpoint": "",
@@ -117,11 +120,11 @@
             "value": ""
           }
         ],
-        "file": null,
+        "filePath": "",
+        "sendFileAsBody": false,
         "duplicates": []
       }
     ],
-    "modifiedAt": "2019-01-25T21:10:07.718Z",
     "duplicates": [
       0
     ],

@@ -1,5 +1,5 @@
 
-import { Injectable } from '@angular/core';
+import { Injectable, Injector } from '@angular/core';
 import { clipboard, remote } from 'electron';
 import * as storage from 'electron-json-storage';
 import * as fs from 'fs';
@@ -13,15 +13,66 @@ import { Migrations } from 'src/app/libs/migrations.lib';
 import { AlertService } from 'src/app/services/alert.service';
 import { DataService } from 'src/app/services/data.service';
 import { EventsService } from 'src/app/services/events.service';
+import { ServerService } from 'src/app/services/server.service';
 import { SettingsService } from 'src/app/services/settings.service';
+import { ReducerDirectionType } from 'src/app/stores/environments.reducer';
+import { EnvironmentsStore, TabsNameType } from 'src/app/stores/environments.store';
 import { DataSubjectType, ExportType } from 'src/app/types/data.type';
 import { CurrentEnvironmentType, EnvironmentsType, EnvironmentType } from 'src/app/types/environment.type';
 import { CORSHeaders, HeaderType, RouteType } from 'src/app/types/route.type';
 import * as uuid from 'uuid/v1';
 
+/**
+ * WIP
+ *
+ * TODO
+ *
+ * review all actions for envs:
+ * - add new DONE
+ * - select active DONE
+ * - remove DONE
+ * - duplicate DONE
+ * - select next / previous DONE
+ * - headers DONE
+ * - update DONE
+ * - move (dragula) DONE
+ * - conflict calculation
+ * - needRestart calculation WIP working, needs to be implemented for the rest of the properties
+ *
+ * review all actions for routes:
+ * - add route DONE
+ * - select route DONE
+ * - remove route DONE
+ * - duplicate DONE
+ * - create when no environment DONE
+ * - select next / previous DONE
+ * - headers DONE
+ * - update DONE --> need to migrate file object to a simple filepath and read the mime etc when serving instead of model change DONE
+ * - move (dragula) --> reorder must trigger needRestart DONE
+ * - conflict calculation
+ * - do headers migration
+ * misc:
+ * - move environment running / startedAt, in specific array of the state DONE
+ * - tab switching DONE (need to refactor when reintegrating missing sections from app)
+ * - customize typeahead design DONE
+ *
+ *
+ * - implements redux devtools WIP --> need to see if it's not crashing in prod mode (also reduce the boilerplate, maybe connect to devtools at app entrance?)
+ * - rename environmentsStore in store ?
+ * - conflict calculation / duplicates, move it in a specific store?
+ * - subscribe to store in order to save instead of triggering an envupdate event
+ * - to avoid restarts for small things bound to the route declaration (latency, etc) we should rely on the store because it's not anymore a passed by reference env object
+ * - import export etc
+ * - editorsettings, put in a store?
+ * - DRY the reducer a little bit
+ * - body is emitting twice, do we lost data ? can we avoid this?
+ */
+
+
 @Injectable()
 export class EnvironmentsService {
-  public selectEnvironment: Subject<number> = new Subject<number>();
+  public selectEnvironment$: Subject<number> = new Subject<number>();
+  // TODO remove and replace by a subscription:
   public environmentUpdateEvents: Subject<{
     environment?: EnvironmentType
   }> = new Subject<{
@@ -30,20 +81,17 @@ export class EnvironmentsService {
   public environmentsReady: Subject<boolean> = new Subject<boolean>();
   public environments: EnvironmentsType;
   public routesTotal = 0;
+  private serverService: ServerService;
   private dialog = remote.dialog;
   private BrowserWindow = remote.BrowserWindow;
   private environmentSchema: EnvironmentType = {
     uuid: '',
-    running: false,
     name: '',
     endpointPrefix: '',
     latency: 0,
     port: 3000,
     routes: [],
-    startedAt: null,
-    modifiedAt: null,
     duplicates: [],
-    needRestart: false,
     proxyMode: false,
     proxyHost: '',
     https: false,
@@ -52,11 +100,7 @@ export class EnvironmentsService {
   };
 
   private environmentResetSchema: Partial<EnvironmentType> = {
-    running: false,
-    startedAt: null,
-    modifiedAt: null,
-    duplicates: [],
-    needRestart: false
+    duplicates: []
   };
 
   private routeSchema: RouteType = {
@@ -68,12 +112,13 @@ export class EnvironmentsService {
     latency: 0,
     statusCode: '200',
     headers: [],
-    file: null,
+    filePath: '',
+    sendFileAsBody: false,
     duplicates: []
   };
 
-  private emptyHeaderSchema: HeaderType = { uuid: '', key: '', value: '' };
-  private routeHeadersSchema: HeaderType = { uuid: '', key: '', value: '' };
+  private emptyHeaderSchema: HeaderType = { key: '', value: '' };
+  private routeHeadersSchema: HeaderType = { key: '', value: '' };
 
   private storageKey = 'environments';
 
@@ -81,8 +126,14 @@ export class EnvironmentsService {
     private alertService: AlertService,
     private dataService: DataService,
     private eventsService: EventsService,
-    private settingsService: SettingsService
+    private settingsService: SettingsService,
+    private environmentsStore: EnvironmentsStore,
+    private injector: Injector
   ) {
+    setTimeout(() => {
+      this.serverService = this.injector.get(ServerService);
+    });
+
     // get existing environments from storage or default one
     storage.get(this.storageKey, (error, environments) => {
       // if empty object
@@ -93,14 +144,18 @@ export class EnvironmentsService {
         this.environments = [defaultEnvironment];
 
         this.updateRoutesTotal();
+        this.environmentsStore.setInitialState(this.environments);
 
-        this.environmentsReady.next(true);
+        // this.environmentsReady.next(true);
       } else {
         // wait for settings to be ready before migrating and loading envs
         this.settingsService.settingsReady.subscribe((ready) => {
           if (ready) {
-            this.environments = this.migrateData(environments);
-            this.environmentsReady.next(true);
+            const migratedData = this.migrateData(environments);
+            this.environments = migratedData;
+            // this.environmentsReady.next(true);
+
+            this.environmentsStore.setInitialState(migratedData);
           }
         });
       }
@@ -110,7 +165,7 @@ export class EnvironmentsService {
     this.environmentUpdateEvents.pipe(debounceTime(1000)).subscribe((params) => {
       this.updateRoutesTotal();
 
-      storage.set(this.storageKey, this.cleanBeforeSave());
+      storage.set(this.storageKey, this.environments);
     });
 
     // subscribe to environment data update from UI
@@ -124,11 +179,39 @@ export class EnvironmentsService {
   }
 
   /**
-   * Add a new environment and save it
-   *
+   * Set active environment by UUID or navigation
    */
-  public addEnvironment(): number {
-    const newRoute = Object.assign({}, this.routeSchema, { headers: [Object.assign({}, this.routeHeadersSchema, { uuid: uuid() })] });
+  public setActiveEnvironment(environmentUUIDOrDirection: string | ReducerDirectionType) {
+    if (this.environmentsStore.getEnvironments().activeEnvironmentUUID !== environmentUUIDOrDirection) {
+      if (environmentUUIDOrDirection === 'next' || environmentUUIDOrDirection === 'previous') {
+        this.environmentsStore.update({ type: 'NAVIGATE_ENVIRONMENTS', direction: environmentUUIDOrDirection });
+      } else {
+        this.environmentsStore.update({ type: 'SET_ACTIVE_ENVIRONMENT', UUID: environmentUUIDOrDirection });
+      }
+
+      this.eventsService.analyticsEvents.next(AnalyticsEvents.NAVIGATE_ENVIRONMENT);
+    }
+  }
+
+  /**
+   * Set active route by UUID or navigation
+   */
+  public setActiveRoute(routeUUIDOrDirection: string | ReducerDirectionType) {
+    if (this.environmentsStore.getEnvironments().activeRouteUUID !== routeUUIDOrDirection) {
+      if (routeUUIDOrDirection === 'next' || routeUUIDOrDirection === 'previous') {
+        this.environmentsStore.update({ type: 'NAVIGATE_ROUTES', direction: routeUUIDOrDirection });
+      } else {
+        this.environmentsStore.update({ type: 'SET_ACTIVE_ROUTE', UUID: routeUUIDOrDirection });
+      }
+
+      this.eventsService.analyticsEvents.next(AnalyticsEvents.NAVIGATE_ROUTE);
+    }
+  }
+
+  /**
+   * Add a new environment and save it in the store
+   */
+  public addEnvironment() {
     const newEnvironment = Object.assign(
       {},
       this.environmentSchema,
@@ -137,71 +220,178 @@ export class EnvironmentsService {
         name: 'New environment',
         port: 3000,
         routes: [
-          newRoute
+          Object.assign(
+            {},
+            this.routeSchema,
+            { headers: [Object.assign({}, this.routeHeadersSchema, { uuid: uuid() })] }
+          )
         ],
-        modifiedAt: new Date(),
         headers: [{ uuid: uuid(), key: 'Content-Type', value: 'application/json' }]
       }
     );
 
-    const newEnvironmentIndex = this.environments.push(newEnvironment) - 1;
-
+    this.environmentsStore.update({ type: 'ADD_ENVIRONMENT', item: newEnvironment });
     this.eventsService.analyticsEvents.next(AnalyticsEvents.CREATE_ENVIRONMENT);
 
+    // TODO move
     this.environmentUpdateEvents.next({ environment: newEnvironment });
-
-    return newEnvironmentIndex;
   }
 
   /**
-   * Add a new route and save it
-   *
-   * @param environment - environment to which add a route
+   * Duplicate an environment, or the active environment and append it at the end of the list.
    */
-  public addRoute(environment: EnvironmentType): number {
-    const newRoute = Object.assign({}, this.routeSchema, { uuid: uuid(), headers: [Object.assign({}, this.routeHeadersSchema, { uuid: uuid() })] });
-    const newRouteIndex = environment.routes.push(newRoute) - 1;
+  public duplicateEnvironment(environmentUUID?: string) {
+    let environmentToDuplicate = this.environmentsStore.getActiveEnvironment();
 
+    if (environmentUUID) {
+      environmentToDuplicate = this.environmentsStore.getEnvironments().environments.find(environment => environment.uuid === environmentUUID);
+    }
+
+    if (environmentToDuplicate) {
+      // copy the environment, reset some properties and change name
+      let newEnvironment: EnvironmentType = {
+        ...cloneDeep(environmentToDuplicate),
+        ...this.environmentResetSchema,
+        name: `${environmentToDuplicate.name} (copy)`
+      };
+
+      newEnvironment = this.renewUUIDs(newEnvironment, 'environment') as EnvironmentType;
+
+      this.environmentsStore.update({ type: 'ADD_ENVIRONMENT', item: newEnvironment });
+
+      this.eventsService.analyticsEvents.next(AnalyticsEvents.DUPLICATE_ENVIRONMENT);
+
+      // TODO move
+      this.environmentUpdateEvents.next({ environment: newEnvironment });
+    }
+  }
+
+  /**
+   * Remove an environment or the current one if not environmentUUID is provided
+   */
+  public removeEnvironment(environmentUUID?: string) {
+    const currentEnvironmentUUID = this.environmentsStore.getActiveEnvironmentUUID();
+
+    if (!environmentUUID) {
+      if (!currentEnvironmentUUID) {
+        return;
+      }
+      environmentUUID = this.environmentsStore.getActiveEnvironmentUUID();
+    }
+
+    this.eventsService.environmentDeleted.emit(environmentUUID);
+
+    this.environmentsStore.update({ type: 'REMOVE_ENVIRONMENT', UUID: environmentUUID });
+
+    // TODO move this.checkEnvironmentsDuplicates();
+
+    this.eventsService.analyticsEvents.next(AnalyticsEvents.DELETE_ENVIRONMENT);
+
+    // TODO move
+    this.environmentUpdateEvents.next({});
+  }
+
+  /**
+   * Add a new route and save it in the store
+   */
+  public addRoute() {
+    const newRoute = Object.assign(
+      {},
+      this.routeSchema,
+      { uuid: uuid(), headers: [Object.assign({}, this.routeHeadersSchema, { uuid: uuid() })] }
+    );
+
+    this.environmentsStore.update({ type: 'ADD_ROUTE', item: newRoute });
     this.eventsService.analyticsEvents.next(AnalyticsEvents.CREATE_ROUTE);
 
-    this.environmentUpdateEvents.next({ environment });
+    // TODO move
+    this.environmentUpdateEvents.next({});
+  }
 
-    return newRouteIndex;
+  /**
+   * Duplicate a route, or the current active route and append it at the end
+   */
+  public duplicateRoute(routeUUID?: string) {
+    let routeToDuplicate = this.environmentsStore.getActiveRoute();
+
+    if (routeUUID) {
+      routeToDuplicate = this.environmentsStore.getActiveEnvironment().routes.find(route => route.uuid === routeUUID);
+    }
+
+    if (routeToDuplicate) {
+      let newRoute = {
+        ...cloneDeep(routeToDuplicate),
+        duplicates: []
+      };
+
+      newRoute = this.renewUUIDs(newRoute, 'route') as RouteType;
+
+      this.environmentsStore.update({ type: 'ADD_ROUTE', item: newRoute });
+
+      this.eventsService.analyticsEvents.next(AnalyticsEvents.DUPLICATE_ROUTE);
+
+      // TODO move
+      this.environmentUpdateEvents.next({});
+    }
   }
 
   /**
    * Remove a route and save
-   *
-   * @param environment - environment to which remove a route
-   * @param routeIndex - route index to remove
    */
-  public removeRoute(environment: EnvironmentType, routeIndex: number) {
-    // delete the route
-    environment.routes.splice(routeIndex, 1);
+  public removeRoute(routeUUID: string = this.environmentsStore.getActiveRouteUUID()) {
+    this.environmentsStore.update({ type: 'REMOVE_ROUTE', UUID: routeUUID });
 
-    this.checkRoutesDuplicates(environment);
+    // TODO move this.checkRoutesDuplicates(environment);
 
     this.eventsService.analyticsEvents.next(AnalyticsEvents.DELETE_ROUTE);
 
-    this.environmentUpdateEvents.next({
+    /* this.environmentUpdateEvents.next({
       environment
-    });
+    }); */
   }
 
   /**
-   * Remove an environment and save
-   *
-   * @param environmentIndex - environment index to remove
+   * Set active tab
    */
-  public removeEnvironment(environmentIndex: number) {
-    this.eventsService.environmentDeleted.emit(this.environments[environmentIndex]);
+  public setActiveTab(activeTab: TabsNameType) {
+    this.environmentsStore.update({ type: 'SET_ACTIVE_TAB', item: activeTab });
+  }
 
-    // delete the environment
-    this.environments.splice(environmentIndex, 1);
+  /**
+   * Update the active environment
+   */
+  public updateActiveEnvironment(properties: { [T in keyof EnvironmentType]?: EnvironmentType[T] }) {
+    this.environmentsStore.update({ type: 'UPDATE_ENVIRONMENT', properties });
+  }
 
-    this.checkEnvironmentsDuplicates();
+  /**
+   * Update the active route
+   */
+  public updateActiveRoute(properties: { [T in keyof RouteType]?: RouteType[T] }) {
+    this.environmentsStore.update({ type: 'UPDATE_ROUTE', properties });
+  }
 
-    this.environmentUpdateEvents.next({});
+  /**
+   * Start / stop active environment
+   */
+  public toggleActiveEnvironment() {
+    const activeEnvironment = this.environmentsStore.getActiveEnvironment();
+    const environmentsStatus = this.environmentsStore.getEnvironmentsStatus();
+    const activeEnvironmentState = environmentsStatus[activeEnvironment.uuid];
+
+    if (activeEnvironmentState.running) {
+      this.serverService.stop(activeEnvironment.uuid);
+
+      this.eventsService.analyticsEvents.next(AnalyticsEvents.SERVER_STOP);
+
+      if (activeEnvironmentState.needRestart) {
+        this.serverService.start(activeEnvironment);
+        this.eventsService.analyticsEvents.next(AnalyticsEvents.SERVER_RESTART);
+      }
+    } else {
+      this.serverService.start(activeEnvironment);
+      this.eventsService.analyticsEvents.next(AnalyticsEvents.SERVER_START);
+    }
   }
 
   /**
@@ -225,7 +415,6 @@ export class EnvironmentsService {
         body: '{\n    "response": "So Long, and Thanks for All the Fish"\n}'
       }
     ));
-    defaultEnvironment.modifiedAt = new Date();
 
     return defaultEnvironment;
   }
@@ -292,25 +481,6 @@ export class EnvironmentsService {
   }
 
   /**
-   * Clean environments before saving
-   *
-   */
-  private cleanBeforeSave() {
-    const environmentsCopy: EnvironmentsType = this.environments.map((environment: EnvironmentType): EnvironmentType => {
-      const environmentCopy = cloneDeep(environment);
-
-      // remove some items
-      delete environmentCopy.running;
-      delete environmentCopy.startedAt;
-      delete environmentCopy.needRestart;
-
-      return environmentCopy;
-    });
-
-    return environmentsCopy;
-  }
-
-  /**
    * Migrate data after loading if needed.
    * This cumulate all versions migration
    *
@@ -354,75 +524,21 @@ export class EnvironmentsService {
       });
     } else if (subject === 'environment') {
       (data as EnvironmentType).uuid = uuid();
-      (data as EnvironmentType).headers.forEach(header => {
-        header.uuid = uuid();
-      });
       (data as EnvironmentType).routes.forEach(route => {
         this.renewUUIDs(route, 'route');
       });
     } else if (subject === 'route') {
       (data as RouteType).uuid = uuid();
-      (data as RouteType).headers.forEach(header => {
-        header.uuid = uuid();
-      });
     }
 
     return data;
   }
 
   /**
-   * Duplicate an environment and put it at the end
-   *
-   * @param environmentIndex
+   * Move a menu item (envs / routes)
    */
-  public duplicateEnvironment(environmentIndex: number): number {
-    // copy the environment, reset some properties and change name
-    let newEnvironment: EnvironmentType = Object.assign(
-      cloneDeep(this.environments[environmentIndex]),
-      this.environmentResetSchema,
-      {
-        name: this.environments[environmentIndex].name + ' (copy)'
-      }
-    );
-
-    newEnvironment = this.renewUUIDs(newEnvironment, 'environment') as EnvironmentType;
-
-    const newEnvironmentIndex = this.environments.push(newEnvironment) - 1;
-
-    this.eventsService.analyticsEvents.next(AnalyticsEvents.DUPLICATE_ENVIRONMENT);
-
-    this.environmentUpdateEvents.next({ environment: newEnvironment });
-
-    return newEnvironmentIndex;
-  }
-
-  /**
-   * Duplicate a route and add it at the end
-   *
-   * @param environment
-   * @param routeIndex
-   */
-  public duplicateRoute(environment: EnvironmentType, routeIndex: number): number {
-    // copy the route, reset duplicates (use cloneDeep to avoid headers pass by reference)
-    let newRoute = Object.assign({}, cloneDeep(environment.routes[routeIndex]), { duplicates: [] });
-
-    newRoute = this.renewUUIDs(newRoute, 'route') as RouteType;
-
-    const newRouteIndex = environment.routes.push(newRoute) - 1;
-
-    this.eventsService.analyticsEvents.next(AnalyticsEvents.DUPLICATE_ROUTE);
-
-    this.environmentUpdateEvents.next({ environment });
-
-    return newRouteIndex;
-  }
-
-  public findEnvironmentIndex(environmentUUID: string): number {
-    return this.environments.findIndex(environment => environment.uuid === environmentUUID);
-  }
-
-  public findRouteIndex(environment: EnvironmentType, routeUUID: string): number {
-    return environment.routes.findIndex(route => route.uuid === routeUUID);
+  public moveMenuItem(type: 'routes' | 'environments' | string, sourceIndex: number, targetIndex: number) {
+    this.environmentsStore.update({ type: (type === 'environments') ? 'MOVE_ENVIRONMENTS' : 'MOVE_ROUTES', indexes: { sourceIndex, targetIndex } });
   }
 
   /**
@@ -508,7 +624,7 @@ export class EnvironmentsService {
 
         // if only one environment ask for selection of the one just created
         if (this.environments.length === 1) {
-          this.selectEnvironment.next(0);
+          this.selectEnvironment$.next(0);
         }
 
         this.alertService.showAlert('success', Messages.IMPORT_ENVIRONMENT_CLIPBOARD_SUCCESS);
@@ -518,7 +634,7 @@ export class EnvironmentsService {
         if (this.environments.length === 0) {
           const newEnvironmentIndex = this.addEnvironment();
 
-          this.selectEnvironment.next(newEnvironmentIndex);
+          this.selectEnvironment$.next(0);
           this.environments[0].routes = [];
 
           currentEnvironmentIndex = 0;
@@ -596,63 +712,18 @@ export class EnvironmentsService {
   }
 
   /**
-   * Return the route content type or environment content type if any
-   *
-   * @param environment
-   * @param route
+   * Check if active environment has headers
    */
-  public getRouteContentType(environment: EnvironmentType, route: RouteType) {
-    const routeContentType = route.headers.find(header => header.key === 'Content-Type');
-
-    if (routeContentType && routeContentType.value) {
-      return routeContentType.value;
-    }
-
-    const environmentContentType = environment.headers.find(header => header.key === 'Content-Type');
-
-    if (environmentContentType && environmentContentType.value) {
-      return environmentContentType.value;
-    }
-
-    return '';
+  public hasEnvironmentHeaders() {
+    const activeEnvironment = this.environmentsStore.getActiveEnvironment();
+    return activeEnvironment && activeEnvironment.headers.some(header => !!header.key);
   }
 
   /**
-   * Check if an environment has headers
-   *
-   * @param environment
+   * Emit an headers injection event in order to add CORS headers to the headers list component
    */
-  public hasEnvironmentHeaders(environment: EnvironmentType) {
-    return environment.headers.some(header => {
-      return !!header.key;
-    });
-  }
-
-  /**
-   * Add CORS headers to environment headers if not already exists
-   *
-   * @param environment
-   */
-  public setEnvironmentCORSHeaders(environment: EnvironmentType) {
-    CORSHeaders.forEach(CORSHeader => {
-      const headerExists = this.findHeaderByName(environment.headers, CORSHeader.key);
-      // only write header if wasn't found or has no value
-      if (!headerExists) {
-        environment.headers.push({ uuid: uuid(), key: CORSHeader.key, value: CORSHeader.value });
-      } else if (!headerExists.value) {
-        headerExists.value = CORSHeader.value;
-      }
-    });
-  }
-
-  /**
-   * Find a header by its key
-   *
-   * @param headers
-   * @param name
-   */
-  private findHeaderByName(headers: HeaderType[], name: string) {
-    return headers.find(header => header.key === name);
+  public setEnvironmentCORSHeaders() {
+    this.eventsService.injectHeaders.emit({ target: 'environmentHeaders', headers: CORSHeaders });
   }
 
   /**

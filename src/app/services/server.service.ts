@@ -5,20 +5,30 @@ import * as http from 'http';
 import * as proxy from 'http-proxy-middleware';
 import * as https from 'https';
 import * as killable from 'killable';
+import * as mimeTypes from 'mime-types';
 import * as path from 'path';
 import { Config } from 'src/app/config';
-import { AnalyticsEvents } from 'src/app/enums/analytics-events.enum';
 import { Errors } from 'src/app/enums/errors.enum';
 import { DummyJSONParser } from 'src/app/libs/dummy-helpers.lib';
+import { ExpressMiddlewares } from 'src/app/libs/express-middlewares.lib';
+import { Utils } from 'src/app/libs/utils.lib';
 import { AlertService } from 'src/app/services/alert.service';
 import { DataService } from 'src/app/services/data.service';
-import { EnvironmentsService } from 'src/app/services/environments.service';
 import { EventsService } from 'src/app/services/events.service';
 import { pemFiles } from 'src/app/ssl';
+import { EnvironmentsStore } from 'src/app/stores/environments.store';
 import { EnvironmentType } from 'src/app/types/environment.type';
 import { CORSHeaders, HeaderType, mimeTypesWithTemplating, RouteType } from 'src/app/types/route.type';
 import { EnvironmentLogsType } from 'src/app/types/server.type';
 import { URL } from 'url';
+
+/***
+ * TODO
+ * use store instead of passed by reference environment (so we don't have to restart for everything)
+ *
+ * - env route latency DONE
+ * - env cors headers override DONE
+ */
 
 const httpsConfig = {
   key: pemFiles.key,
@@ -28,23 +38,18 @@ const httpsConfig = {
 @Injectable()
 export class ServerService {
   public environmentsLogs: EnvironmentLogsType = {};
-  // store running servers instances
-  private instances: { [key: string]: any };
+  // running servers instances
+  private instances: { [key: string]: any } = {};
 
   constructor(
     private alertService: AlertService,
     private dataService: DataService,
     private eventsService: EventsService,
-    private environmentService: EnvironmentsService
+    private environmentsStore: EnvironmentsStore
   ) {
-    this.eventsService.environmentDeleted.subscribe((environment: EnvironmentType) => {
-      // stop if needed before deletion
-      if (environment.running) {
-        this.stop(environment);
-      }
-
-      // delete the request logs
-      this.deleteEnvironmentLogs(environment.uuid);
+    this.eventsService.environmentDeleted.subscribe((environmentUUID: string) => {
+      this.stop(environmentUUID);
+      this.deleteEnvironmentLogs(environmentUUID);
     });
   }
 
@@ -67,16 +72,17 @@ export class ServerService {
     // listen to port
     serverInstance.listen(environment.port, () => {
       this.instances[environment.uuid] = serverInstance;
-      environment.running = true;
-      environment.startedAt = new Date();
+      this.environmentsStore.update({ type: 'UPDATE_ENVIRONMENT_STATUS', properties: { running: true, needRestart: false } });
+    });
+
+    // apply middlewares
+    ExpressMiddlewares.forEach(expressMiddleware => {
+      server.use(expressMiddleware);
     });
 
     // apply latency, cors, routes and proxy to express server
-    this.analytics(server);
-    this.rewriteUrl(server);
-    this.parseBody(server);
     this.logRequests(server, environment);
-    this.setEnvironmentLatency(server, environment);
+    this.setEnvironmentLatency(server, environment.uuid);
     this.setRoutes(server, environment);
     this.setCors(server, environment);
     this.enableProxy(server, environment);
@@ -97,17 +103,14 @@ export class ServerService {
 
   /**
    * Completely stop an environment / server
-   *
-   * @param environment - an environment
    */
-  public stop(environment: EnvironmentType) {
-    const instance = this.instances[environment.uuid];
+  public stop(environmentUUID: string) {
+    const instance = this.instances[environmentUUID];
 
     if (instance) {
       instance.kill(() => {
-        delete this.instances[environment.uuid];
-        environment.running = false;
-        environment.startedAt = null;
+        delete this.instances[environmentUUID];
+        this.environmentsStore.update({ type: 'UPDATE_ENVIRONMENT_STATUS', properties: { running: false, needRestart: false } });
       });
     }
   }
@@ -118,36 +121,10 @@ export class ServerService {
    * @param headerName
    */
   public testHeaderValidity(headerName: string) {
-    if (headerName.match(/[^A-Za-z0-9\-\!\#\$\%\&\'\*\+\.\^\_\`\|\~]/g)) {
+    if (headerName && headerName.match(/[^A-Za-z0-9\-\!\#\$\%\&\'\*\+\.\^\_\`\|\~]/g)) {
       return true;
     }
     return false;
-  }
-
-  /**
-   * Send event for all entering requests
-   *
-   * @param server - express instance
-   */
-  private analytics(server: any) {
-    server.use((req, res, next) => {
-      this.eventsService.analyticsEvents.next(AnalyticsEvents.SERVER_ENTERING_REQUEST);
-
-      next();
-    });
-  }
-
-  /**
-   * Remove multiple slash and replace by single slash
-   *
-   * @param server - express instance
-   */
-  private rewriteUrl(server: any) {
-    server.use((req, res, next) => {
-      req.url = req.url.replace(/\/{2,}/g, '/');
-
-      next();
-    });
   }
 
   /**
@@ -160,10 +137,12 @@ export class ServerService {
   private setCors(server: any, environment: EnvironmentType) {
     if (environment.cors) {
       server.options('/*', (req, res) => {
+        const environmentSelected = this.environmentsStore.getEnvironmentByUUID(environment.uuid);
+
         this.setHeaders(CORSHeaders, req, res);
 
         // override default CORS headers with environment's headers
-        this.setHeaders(environment.headers, req, res);
+        this.setHeaders(environmentSelected.headers, req, res);
 
         res.send(200);
       });
@@ -185,7 +164,7 @@ export class ServerService {
           server[route.method]('/' + ((environment.endpointPrefix) ? environment.endpointPrefix + '/' : '') + route.endpoint.replace(/ /g, '%20'), (req, res) => {
             // add route latency if any
             setTimeout(() => {
-              const routeContentType = this.environmentService.getRouteContentType(environment, route);
+              const routeContentType = Utils.getRouteContentType(environment, route);
 
               // set http code
               res.status(route.statusCode);
@@ -194,26 +173,27 @@ export class ServerService {
               this.setHeaders(route.headers, req, res);
 
               // send the file
-              if (route.file) {
+              if (route.filePath) {
                 let filePath: string;
 
                 // throw error or serve file
                 try {
-                  filePath = DummyJSONParser(route.file.path, req);
+                  filePath = DummyJSONParser(route.filePath, req);
+                  const fileMimeType = mimeTypes.lookup(route.filePath);
 
                   // if no route content type set to the one detected
                   if (!routeContentType) {
-                    res.set('Content-Type', route.file.mimeType);
+                    res.set('Content-Type', fileMimeType);
                   }
 
                   let fileContent: Buffer | string = fs.readFileSync(filePath);
 
                   // parse templating for a limited list of mime types
-                  if (mimeTypesWithTemplating.indexOf(route.file.mimeType) > -1) {
+                  if (mimeTypesWithTemplating.indexOf(fileMimeType) > -1) {
                     fileContent = DummyJSONParser(fileContent.toString('utf-8', 0, fileContent.length), req);
                   }
 
-                  if (!route.file.sendAsBody) {
+                  if (!route.sendFileAsBody) {
                     res.set('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`);
                   }
                   res.send(fileContent);
@@ -326,30 +306,6 @@ export class ServerService {
   }
 
   /**
-   * Parse body as a raw string
-   *
-   * @param server - server on which to parse the body
-   */
-  private parseBody(server: any) {
-    try {
-      server.use((req, res, next) => {
-        req.setEncoding('utf8');
-        req.body = '';
-
-        req.on('data', (chunk) => {
-          req.body += chunk;
-        });
-
-        req.on('end', () => {
-          next();
-        });
-      });
-    } catch (error) {
-
-    }
-  }
-
-  /**
    * Logs all request made to the environment
    *
    * @param server - server on which to log the request
@@ -378,14 +334,13 @@ export class ServerService {
    * Set the environment latency if any
    *
    * @param server - server instance
-   * @param environment - environment
+   * @param environmentUUID - environment UUID
    */
-  private setEnvironmentLatency(server: any, environment: EnvironmentType) {
-    if (environment.latency > 0) {
-      server.use((req, res, next) => {
-        setTimeout(next, environment.latency);
-      });
-    }
+  private setEnvironmentLatency(server: any, environmentUUID: string) {
+    server.use((req, res, next) => {
+      const environmentSelected = this.environmentsStore.getEnvironmentByUUID(environmentUUID);
+      setTimeout(next, environmentSelected.latency);
+    });
   }
 
   /**
@@ -413,10 +368,8 @@ export class ServerService {
 
   /**
    * Delete an environment log
-   *
-   * @param environmentUuid
    */
-  public deleteEnvironmentLogs(environmentUuid: string) {
-    delete this.environmentsLogs[environmentUuid];
+  public deleteEnvironmentLogs(environmentUUID: string) {
+    delete this.environmentsLogs[environmentUUID];
   }
 }

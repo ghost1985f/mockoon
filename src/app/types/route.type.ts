@@ -304,12 +304,8 @@ export type RouteType = {
   headers: HeaderType[];
   body?: string;
   latency: number;
-  file?: {
-    path?: string;
-    filename: string;
-    mimeType: string;
-    sendAsBody?: boolean;
-  };
+  filePath: string;
+  sendFileAsBody: boolean;
 
   /**
    * Store duplicates routes indexes, use .length to assess if there is any duplicate
@@ -317,9 +313,9 @@ export type RouteType = {
   duplicates: number[];
 };
 
-export type HeaderType = { uuid: '', key: string, value: string };
+export type HeaderType = { key: string, value: string };
 
-export const CORSHeaders: Partial<HeaderType>[] = [
+export const CORSHeaders: HeaderType[] = [
   { key: 'Access-Control-Allow-Origin', value: '*' },
   { key: 'Access-Control-Allow-Methods', value: 'GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS' },
   { key: 'Access-Control-Allow-Headers', value: 'Content-Type, Origin, Accept, Authorization, Content-Length, X-Requested-With' }

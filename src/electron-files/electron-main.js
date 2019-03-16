@@ -1,17 +1,17 @@
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 const electron = require('electron');
 const windowState = require('electron-window-state');
-// Module to control application life.
-const app = electron.app;
-const shell = electron.shell;
-
-// Module to create native browser window.
-const BrowserWindow = electron.BrowserWindow;
-
 const fs = require('fs');
 const mkdirp = require('mkdirp');
 const path = require('path');
 const url = require('url');
 const isDev = require('electron-is-dev');
+
+const app = electron.app;
+const shell = electron.shell;
+const BrowserWindow = electron.BrowserWindow;
+
 
 // if serving enable hot reload
 const args = process.argv.slice(1);
@@ -19,8 +19,6 @@ const args = process.argv.slice(1);
 // init CMD flags
 const isServing = args.some(val => val === '--serve');
 const isTesting = args.some(val => val === '--tests');
-
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 // set test folder when testing
 if (isTesting) {
@@ -36,8 +34,6 @@ if (isDev && isServing) {
   require('electron-reload')(__dirname, {});
 }
 
-// Keep a global reference of the window object, if you don't, the window will
-// be closed automatically when the JavaScript object is garbage collected.
 let mainWindow;
 
 function createWindow() {
@@ -77,9 +73,14 @@ function createWindow() {
     slashes: true
   }));
 
-  // Open the DevTools except when running functional tests
+  // Open the DevTools / Redux except when running functional tests
   if (isDev && !isTesting) {
     mainWindow.webContents.openDevTools()
+
+    const { default: installExtension, REDUX_DEVTOOLS } = require('electron-devtools-installer');
+    installExtension(REDUX_DEVTOOLS)
+      .then((name) => console.log(`Added Extension: ${name}`))
+      .catch((err) => console.log('An error occurred: ', err));
   }
 
   // Emitted when the window is closed.
@@ -89,7 +90,6 @@ function createWindow() {
     // when you should delete the corresponding element.
     mainWindow = null
   });
-
 
   // create prod menu
   var menu = [

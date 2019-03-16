@@ -2,15 +2,11 @@ import { HeaderType, RouteType } from 'src/app/types/route.type';
 
 export type EnvironmentType = {
   uuid: string;
-  running: boolean;
   name: string;
   port: number;
   endpointPrefix: string;
   latency: number;
   routes: RouteType[];
-  startedAt?: Date;
-  modifiedAt?: Date;
-  needRestart?: boolean;
   proxyMode: boolean;
   proxyHost: string;
   https: boolean;
