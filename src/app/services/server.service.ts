@@ -2,6 +2,8 @@ import { Injectable } from '@angular/core';
 import * as express from 'express';
 import * as fs from 'fs';
 import * as http from 'http';
+import * as url from 'url';
+import * as crypto from 'crypto';
 import * as proxy from 'http-proxy-middleware';
 import * as https from 'https';
 import * as killable from 'killable';
@@ -72,6 +74,7 @@ export class ServerService {
     // apply latency, cors, routes and proxy to express server
     this.analytics(server);
     this.rewriteUrl(server);
+    this.redirectToVirtualRoute(server);
     this.parseBody(server);
     this.logRequests(server, environment);
     this.setEnvironmentLatency(server, environment);
@@ -146,6 +149,23 @@ export class ServerService {
     });
   }
 
+  private redirectToVirtualRoute(server: any) {
+    server.use((req, res, next) => {
+      const query = req.query;
+      const searchParts = [];
+      Object.keys(query).forEach(key => {
+        searchParts.push(`${key}=${query[key]}`);
+      });
+      if (searchParts.length) {
+        const search = '?' + searchParts.join('=');
+        const hash = crypto.createHash('md5').update(search).digest('hex') + '/';
+        req.url = req.path + '/' + hash;
+      }
+
+      next();
+    });
+  }
+
   /**
    * Always answer with status 200 to CORS pre flight OPTIONS requests if option activated.
    * /!\ Must be called after the routes creation otherwise it will intercept all user defined OPTIONS routes.
@@ -165,6 +185,18 @@ export class ServerService {
     }
   }
 
+  private buildRouteVirtualEndpoint(route: RouteType): string {
+    const pUrl = url.parse(route.endpoint, false);
+    if (!pUrl.search) {
+      return route.endpoint;
+    }
+    
+    const path = pUrl.pathname ? pUrl.pathname + '/' : '';
+    const hash = crypto.createHash('md5').update(pUrl.search).digest('hex') + '/';
+    // virtual endpoint
+    return path + hash; 
+  }
+
   /**
    * Generate an environment routes and attach to running server
    *
@@ -177,7 +209,10 @@ export class ServerService {
       if (!route.duplicates.length) {
         try {
           // create route
-          server[route.method]('/' + ((environment.endpointPrefix) ? environment.endpointPrefix + '/' : '') + route.endpoint.replace(/ /g, '%20'), (req, res) => {
+          const prefix = (environment.endpointPrefix) ? environment.endpointPrefix + '/' : '';
+          const endpoint = this.buildRouteVirtualEndpoint(route)
+            .replace(/ /g, '%20');
+          server[route.method]('/' + prefix + endpoint, (req, res) => {
             // add route latency if any
             setTimeout(() => {
               const routeContentType = this.environmentService.getRouteContentType(environment, route);
